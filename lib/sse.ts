@@ -20,6 +20,10 @@ export type StreamCallbacks = {
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:7860';
 
+// Safety cap: any single generation longer than this is abnormal.
+// Tune up if you regularly generate 30-min videos.
+const SAFETY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
 export function streamGeneration(
   docId: string,
   chapterNumber: number,
@@ -27,14 +31,13 @@ export function streamGeneration(
   callbacks: StreamCallbacks,
   modelOverrides: ModelOverrides = {},
 ): () => void {
+  // Build query string: standard params + non-empty model overrides
   const params = new URLSearchParams({
     doc_id: docId,
     chapter_number: String(chapterNumber),
     duration_minutes: String(durationMinutes),
   });
 
-  // Append non-empty model overrides as model_<stage> query params
-  // (e.g. model_script=google/gemini-2.5-pro)
   for (const [stage, modelId] of Object.entries(modelOverrides)) {
     if (modelId && modelId !== '') {
       params.set(`model_${stage}`, modelId);
@@ -44,20 +47,33 @@ export function streamGeneration(
   const url = `${API_URL}/generate/stream?${params}`;
   const es = new EventSource(url);
 
+  // Flag to ignore the spurious onerror that fires immediately AFTER es.close()
+  // in some browsers (would otherwise call onError twice).
+  let isClosed = false;
+
+  const safeClose = () => {
+    if (isClosed) return;
+    isClosed = true;
+    clearTimeout(safetyTimeout);
+    es.close();
+  };
+
   const handle = (raw: string) => {
+    if (isClosed) return;
     try {
       const event = JSON.parse(raw) as PipelineEvent;
       console.log('[SSE]', event.type, '·', event.stage, '·', event.message);
       callbacks.onEvent(event);
+
       if (event.type === 'pipeline_complete' && event.result) {
         callbacks.onComplete(event.result);
-        es.close();
+        safeClose();
       } else if (event.type === 'pipeline_error') {
         callbacks.onError(event.message || event.error || 'Pipeline error');
-        es.close();
+        safeClose();
       }
     } catch (err) {
-      console.error('SSE parse error:', err, raw);
+      console.error('[SSE] parse error:', err, raw);
     }
   };
 
@@ -65,12 +81,36 @@ export function streamGeneration(
     (name) => es.addEventListener(name, (e) => handle((e as MessageEvent).data)),
   );
 
-  es.onerror = () => {
-    // EventSource auto-retries on transient errors; only treat closed state as fatal
-    if (es.readyState === EventSource.CLOSED) {
-      callbacks.onError('Connection lost');
-    }
+  // Force-close on ANY connection error.
+  // EventSource's default behavior is to auto-reconnect to the same URL,
+  // which restarts the entire pipeline on the backend (re-running every agent
+  // and burning money). We'd rather fail visibly and let the user retry manually.
+  es.onerror = (event) => {
+    if (isClosed) return;
+    console.error('[SSE] connection error, closing to prevent pipeline restart', {
+      readyState: es.readyState,
+      event,
+    });
+    safeClose();
+    callbacks.onError(
+      'Connection lost. Your internet may have dropped briefly. Please click Regenerate to try again.',
+    );
   };
 
-  return () => es.close();
+  // Hard timeout: if a generation runs longer than SAFETY_TIMEOUT_MS,
+  // abort it. Protects against backend hangs or any other case where
+  // the connection stays open but no progress is made.
+  const safetyTimeout = setTimeout(() => {
+    if (isClosed) return;
+    console.warn(`[SSE] safety timeout fired after ${SAFETY_TIMEOUT_MS / 1000}s, closing`);
+    safeClose();
+    callbacks.onError(
+      `Generation took too long (>${SAFETY_TIMEOUT_MS / 60000} min). Please try again with faster models.`,
+    );
+  }, SAFETY_TIMEOUT_MS);
+
+  // Cleanup function returned to caller (called on chapter switch, page nav, etc.)
+  return () => {
+    safeClose();
+  };
 }
